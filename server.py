@@ -10,7 +10,11 @@ from sklearn.metrics import classification_report
 import joblib
 import os
 import sys
+import json
 import logging
+import threading
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, timezone
 
 # ============================
@@ -48,6 +52,41 @@ print("SECRET:", config.sh_client_secret)
 
 MODEL_PATH = "disaster_model.pkl"
 SCALER_PATH = "scaler.pkl"
+
+# ============================
+# 📡 NODE.JS BACKEND CONNECTION
+# ============================
+# Schimbă URL-ul cu adresa backend-ului Node.js al colegului
+NODE_BACKEND_URL = os.environ.get("NODE_BACKEND_URL", "http://localhost:3001")
+
+def forward_to_node_backend(report, report_type="weather-risk"):
+    """
+    Trimite raportul AI la backend-ul Node.js.
+    Rulează într-un thread separat ca să nu blocheze Flask.
+    """
+    def _send():
+        try:
+            payload = {
+                "source": "cassini-ai",
+                "type": report_type,
+                "received_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "data": report
+            }
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{NODE_BACKEND_URL}/api/alerts",
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                logger.info(f"✅ Alert forwarded to Node.js → {resp.status}")
+        except urllib.error.URLError as e:
+            logger.warning(f"⚠️  Node.js backend unreachable ({NODE_BACKEND_URL}): {e}")
+        except Exception as e:
+            logger.error(f"❌ Forward to Node.js failed: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
 # =========================
 # 🛰️ EVALSCRIPT MULTI-INDEX
 # =========================
@@ -421,7 +460,7 @@ def analyze():
                 "affected_area_percent": round(bare_soil * 100, 2)
             })
         
-        return jsonify({
+        result = {
             "bbox": bbox,
             "period": {"start": start_date, "end": end_date},
             "statistics": {
@@ -432,7 +471,12 @@ def analyze():
             },
             "alerts": alerts,
             "alert_count": len(alerts)
-        })
+        }
+
+        # 📡 Forward la Node.js
+        forward_to_node_backend(result, report_type="satellite-analyze")
+
+        return jsonify(result)
         
     except Exception as e:
         logger.error(f"Eroare la analiză: {e}")
@@ -557,6 +601,9 @@ def weather_risk():
         if predictions:
             report["predictions"] = predictions_to_dict(predictions)
 
+        # 📡 Forward la Node.js
+        forward_to_node_backend(report, report_type="weather-risk-full")
+
         return jsonify(report)
 
     except Exception as e:
@@ -580,12 +627,17 @@ def weather_risk_quick():
         features = get_open_meteo_weather_features(calamity_config)
         calamities = score_calamities(features, calamity_config.thresholds)
 
-        return jsonify({
+        quick_report = {
             "timestamp": now.isoformat().replace("+00:00", "Z"),
             "area": calamity_config.area_name,
             "weather": features_to_dict(features),
             "calamities": calamities,
-        })
+        }
+
+        # 📡 Forward la Node.js
+        forward_to_node_backend(quick_report, report_type="weather-risk-quick")
+
+        return jsonify(quick_report)
 
     except Exception as e:
         logger.error(f"Eroare la weather-risk/quick: {e}")
